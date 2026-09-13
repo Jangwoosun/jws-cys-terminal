@@ -3,7 +3,7 @@
   --bar: #161b22;
   --border: #30363d;
   --hairline: #1c2128; /* pane 구분선 — 거의 안 보이는 미세 선 */
-  --accent: #2f81f7;
+  --accent: #a78bfa;
   --text: #c9d1d9; /* 크롬(상단바·사이드바·모달 등 var(--bar) 표면) 고정 글자 — 배경색 커스텀과 무관 */
   --canvas-text: #c9d1d9; /* 캔버스(var(--bg) 표면) 글자 — applyBgColor가 배경 휘도 따라 전환 */
   --warn: #d29922;
