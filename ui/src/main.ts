@@ -45,6 +45,17 @@ import {
 } from "./resetconfirm";
 import { ccEffectiveZoom } from "./ccscale";
 import { clampWsbarWidth, clampWsbarFont, WSBAR_W_DEFAULT, WSBAR_FONT_STEP } from "./wsbar";
+import {
+  classifyNode,
+  isHealthy,
+  roleTag,
+  titleFor,
+  progressFor,
+  roleRank,
+  ageText,
+  type OrgNodeSig,
+  type TodoEntry,
+} from "./orgcard";
 import { composeFontFamily, FONT_CHOICES, ROLE_COLOR, roleDotColor } from "./appearance";
 import { routeOnData } from "./mousefilter";
 import { MouseTrackingFilter, MOUSE_ALL_OFF } from "./trackfilter";
@@ -1754,8 +1765,11 @@ const panes = new Map<string, PaneRuntime>(); // 키 = paneKey(sid, socket)
 // 부서 데몬 socket_slug(F3 백엔드 단일진실) → socket 경로. launch_dept_daemon 반환·daemon-event로 채운다.
 const socketForSlug = new Map<string, string>();
 // 사이드바 노드 신호 캐시(B3) — org.status 응답을 워크스페이스 행 집계용으로 보관.
-type NodeSig = { role: string | null; state: string; ctx_pct: number | null; idle_secs: number; agent_alive: boolean | null };
+type NodeSig = { role: string | null; state: string; ctx_pct: number | null; idle_secs: number; agent_alive: boolean | null; org: OrgNodeSig };
 const nodeSig = new Map<string, NodeSig>(); // 키 = `${socket}#${surface_id}`
+const todoBySocket = new Map<string, Record<string, TodoEntry>>(); // 부서 카드 진행률(org.status todo)
+// 소켓별 최근 org.status 성공 여부 — 실패 중이면 부서 카드는 직전 신호 대신 '연결 끊김'을 보인다.
+const orgSockOk = new Map<string, boolean>();
 let pendingApprovals = 0; // org.status feed.pending 전 소켓 합산(배지 구동 — 이 값만 배지가 쓴다)
 // 같은 순회의 **소켓별** 대기 수. 배너("다른 워크스페이스에 N건")가 이 맵을 직접 읽는다.
 // ★왜 합계를 나누는가(성찰3 설계렌즈 minor): 종전 배너는 `pendingApprovals - pendingItems.length`
@@ -3491,12 +3505,18 @@ async function refreshSidebarStatus() {
       const r = (await invoke("org_status", { socket: sock })) as {
         surfaces?: any[];
         feed?: { pending?: number };
+        todo?: Record<string, TodoEntry>;
       };
       pend += r.feed?.pending ?? 0;
       // 성공 조회만 기록한다. 실패(catch)는 **덮어쓰지 않는다** — 직전 성공값을 유지하는 편이
       // 0으로 접는 것보다 낫다(일시 미응답으로 배너가 사라지지 않는다). 그 대신 배지 합계
       // pend 는 종전대로 그 소켓을 0으로 세므로, 두 값이 잠시 어긋날 수 있다(배지=보수적 하한).
       pendingBySocket.set(sock ?? DEFAULT_SOCKET_KEY, r.feed?.pending ?? 0);
+      todoBySocket.set(sock ?? DEFAULT_SOCKET_KEY, r.todo ?? {});
+      orgSockOk.set(sock ?? DEFAULT_SOCKET_KEY, true);
+      // 성공 조회에 없는 surface 의 신호는 지운다 — 남기면 사라진 노드가 옛 상태로 계속 칠해진다.
+      const live = new Set((r.surfaces ?? []).map((n) => `${sock}#${n.surface_id}`));
+      for (const k of [...nodeSig.keys()]) if (k.startsWith(`${sock}#`) && !live.has(k)) nodeSig.delete(k);
       for (const n of r.surfaces ?? [])
         nodeSig.set(`${sock}#${n.surface_id}`, {
           role: n.role,
@@ -3504,9 +3524,22 @@ async function refreshSidebarStatus() {
           ctx_pct: n.status?.context_pct ?? n.usage?.ctx_pct ?? null,
           idle_secs: n.idle_secs,
           agent_alive: n.agent_alive,
+          // 부서 카드용 원신호 — 폴백 없이 데몬 필드 그대로(추정 금지 · orgcard.classifyNode 가 판정)
+          org: {
+            role: n.role ?? null,
+            exited: n.exited ?? null,
+            agent_alive: n.agent_alive ?? null,
+            gate: n.gate_pending?.gate ?? null,
+            state: n.status?.state ?? null,
+            task: n.status?.task ?? null,
+            status_age: n.status?.age_secs ?? null,
+            awakened: n.awakened_at != null,
+            ctx_pct: n.status?.context_pct ?? n.usage?.ctx_pct ?? null,
+          },
         });
     } catch {
       /* 부서 데몬 일시 부재 */
+      orgSockOk.set(sock ?? DEFAULT_SOCKET_KEY, false);
     }
   }
   pendingApprovals = pend;
@@ -3604,6 +3637,34 @@ function buildTab(ws: Workspace): HTMLElement {
     sub.appendChild(txt);
   }
   tab.append(titleRow, sub);
+  // 부서 카드: 데몬에 역할로 등록된 노드를 직원 목록으로 — 접어도 "정상 n/m" 은 서브라인에 남는다.
+  const members = ws.pending ? [] : orgMembers(ws, sids);
+  if (members.length) {
+    const healthy = members.filter((m) => isHealthy(m.st.tone)).length;
+    const collapsed = orgCollapsed.has(ws.id);
+    const chev = document.createElement("span");
+    chev.className = "ws-org-chevron";
+    chev.textContent = collapsed ? "▸" : "▾";
+    chev.title = collapsed ? "직원 목록 펼치기" : "직원 목록 접기";
+    chev.addEventListener("mousedown", (e) => e.stopPropagation()); // 탭 전환·드래그와 분리
+    chev.addEventListener("click", (e) => {
+      e.stopPropagation();
+      setOrgCollapsed(ws.id, !collapsed);
+      renderWsTabs();
+    });
+    titleRow.prepend(chev);
+    label.title = label.textContent ?? ""; // chevron 만큼 좁아진 긴 부서명은 hover 로 전체 확인
+    const cnt = document.createElement("span");
+    cnt.className = "ws-org-count" + (healthy < members.length ? " degraded" : "");
+    cnt.textContent = `정상 ${healthy}/${members.length}`;
+    sub.insertBefore(cnt, sub.children[1] ?? null); // 상태 dot 바로 뒤
+    if (!collapsed) {
+      const list = document.createElement("div");
+      list.className = "ws-org-list";
+      for (const m of members) list.appendChild(buildOrgRow(ws, m));
+      tab.append(list);
+    }
+  }
   tab.addEventListener("mousedown", (e) => {
     // 우클릭은 전환하지 않음 — render()가 탭 DOM을 재생성하면 컨텍스트 메뉴가 죽은 엘리먼트를 잡는다
     if (e.button !== 0 || e.target === close) return;
@@ -3699,6 +3760,97 @@ function buildTab(ws: Workspace): HTMLElement {
     render();
   });
   return tab;
+}
+
+// 부서 카드 접힘 상태 — ws id 집합. 뷰어별 편의라 localStorage(실패 시 펼친 채로 동작).
+const ORG_COLLAPSED_KEY = "cys-org-collapsed";
+const orgCollapsed = new Set<number>(
+  (() => {
+    try {
+      const v = JSON.parse(localStorage.getItem(ORG_COLLAPSED_KEY) ?? "[]");
+      return Array.isArray(v) ? v.filter((x): x is number => typeof x === "number") : [];
+    } catch {
+      return [];
+    }
+  })(),
+);
+function setOrgCollapsed(wsId: number, on: boolean) {
+  if (on) orgCollapsed.add(wsId);
+  else orgCollapsed.delete(wsId);
+  try {
+    localStorage.setItem(ORG_COLLAPSED_KEY, JSON.stringify([...orgCollapsed]));
+  } catch {
+    /* 저장 불가(사생활 모드 등) — 이번 세션만 유지 */
+  }
+}
+
+type OrgMember = { sid: number; sig: NodeSig | undefined; role: string | null; st: ReturnType<typeof classifyNode> };
+
+// 마지막으로 본 역할 — 신호가 사라진 pane 도 직책은 유지한 채 '연결 끊김'(회색)으로 보이게 한다.
+const orgRoleMemo = new Map<string, string>();
+
+// ws 의 pane 중 데몬에 역할로 등록된 노드만 직원으로 본다(역할 없는 일반 셸 pane 제외).
+// 신호가 사라진 pane 은 역할 노드가 하나라도 있는 카드에서만 '연결 끊김'으로 남긴다.
+function orgMembers(ws: Workspace, sids: number[]): OrgMember[] {
+  const sockOk = orgSockOk.get(ws.socket ?? DEFAULT_SOCKET_KEY) !== false;
+  const all = sids.map((sid) => {
+    const key = `${ws.socket}#${sid}`;
+    const raw = nodeSig.get(key);
+    if (raw?.role) orgRoleMemo.set(key, raw.role);
+    const sig = sockOk ? raw : undefined; // 최근 조회 실패 = 직전 신호를 정상으로 칠하지 않는다
+    const role = sig ? sig.role : (orgRoleMemo.get(key) ?? null);
+    return { sid, sig, role, st: classifyNode(sig?.org) };
+  });
+  if (!all.some((m) => m.role)) return []; // 데몬이 통째로 침묵해도 기억한 역할로 카드 유지(정상 0/n)
+  return all
+    .filter((m) => m.role || !m.sig)
+    .sort((a, b) => roleRank(a.role) - roleRank(b.role) || a.sid - b.sid);
+}
+
+function buildOrgRow(ws: Workspace, m: OrgMember): HTMLElement {
+  const o = m.sig?.org;
+  const role = m.role;
+  const row = document.createElement("div");
+  row.className = "ws-org-row";
+  row.dataset.orgSid = String(m.sid);
+  const head = document.createElement("div");
+  head.className = "ws-org-head";
+  const dot = document.createElement("span");
+  dot.className = `ws-org-dot tone-${m.st.tone}`;
+  const title = document.createElement("span");
+  title.className = "ws-org-title";
+  title.textContent = role ? titleFor(ws.socket, role) : "노드";
+  const tag = document.createElement("span");
+  tag.className = "ws-org-role";
+  tag.textContent = role ? roleTag(role) : "?";
+  const sidEl = document.createElement("span");
+  sidEl.className = "ws-org-sid";
+  sidEl.textContent = `#${m.sid}`;
+  head.append(dot, title); // 직책이 한 줄 폭을 다 쓰도록 역할 태그·surface id 는 둘째 줄 앞머리로
+  const line = document.createElement("div");
+  line.className = "ws-org-line";
+  const bits = [m.st.label];
+  const task = o?.task?.trim();
+  if (task) bits.push(task); // 작업명이 없으면 상태 라벨(대기 중 등)이 곧 대기 여부다
+  const prog = progressFor(todoBySocket.get(ws.socket ?? DEFAULT_SOCKET_KEY), role);
+  if (prog != null) bits.push(`진행 ${prog}%`);
+  if (o?.ctx_pct != null) bits.push(`CTX ${o.ctx_pct}%`);
+  const text = document.createElement("span");
+  text.className = "ws-org-text";
+  text.textContent = bits.join(" · ");
+  line.append(tag, sidEl, text);
+  row.append(head, line);
+  row.title =
+    `${title.textContent} (${role ?? "역할 미상"}) · surface:${m.sid}\n상태: ${m.st.label}` +
+    (task ? `\n작업: ${task}` : "") +
+    (o?.status_age != null ? `\n자기보고: ${ageText(o.status_age)}` : "") +
+    "\n클릭하면 이 pane 으로 이동합니다";
+  row.addEventListener("mousedown", (e) => e.stopPropagation()); // 탭 전환·드래그와 분리
+  row.addEventListener("click", (e) => {
+    e.stopPropagation();
+    jumpToSurface(m.sid, ws.socket);
+  });
+  return row;
 }
 
 // 06: 그룹 섹션 = 헤더(chevron collapse·name·count·hover add) + body(collapsed면 멤버 DOM 미생성=성능 가드).

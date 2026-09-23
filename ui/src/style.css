@@ -107,6 +107,36 @@ body.wsbar-resizing { cursor: col-resize; -webkit-user-select: none; user-select
 .ws-dot.working { background: var(--ok); }
 .ws-dot.idle { background: var(--warn); }
 .ws-dot.error { background: var(--error); }
+/* 부서 카드(조직도): 직원 목록 + 5색 상태 dot — 초록 작업 · 파랑 대기 · 노랑 시작 · 주황 확인 필요 · 회색 끊김 */
+.ws-org-chevron { flex: none; width: 12px; cursor: pointer; color: #8b949e; }
+.ws-tab.active .ws-org-chevron { color: rgba(255, 255, 255, .85); }
+.ws-org-count { margin-right: 5px; font-weight: 600; color: var(--ok); }
+.ws-org-count.degraded { color: #f0883e; }
+.ws-tab.active .ws-org-count { color: #fff; }
+.ws-org-list {
+  display: flex; flex-direction: column; gap: 2px; margin-top: 5px;
+  font-size: calc(12px * var(--wsbar-font, 1));
+}
+.ws-org-row {
+  padding: 3px 5px; border-radius: 4px; cursor: pointer;
+  background: rgba(0, 0, 0, .18); min-width: 0;
+}
+.ws-org-row:hover { background: rgba(0, 0, 0, .32); }
+.ws-org-head { display: flex; align-items: center; gap: 4px; min-width: 0; }
+.ws-org-dot { flex: none; width: 8px; height: 8px; border-radius: 50%; }
+.ws-org-dot.tone-working { background: var(--ok); }
+.ws-org-dot.tone-waiting { background: #58a6ff; }
+.ws-org-dot.tone-starting { background: #e3b341; }
+.ws-org-dot.tone-attention { background: #f0883e; }
+.ws-org-dot.tone-down { background: #6e7681; }
+.ws-org-title { flex: 1; min-width: 0; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ws-org-role { font-size: .9em; padding: 0 4px; margin-right: 4px; border-radius: 3px; background: rgba(255, 255, 255, .14); }
+.ws-org-sid { margin-right: 5px; opacity: .7; }
+.ws-org-line {
+  font-size: .82em; opacity: .85; padding-left: 12px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.ws-tab.active .ws-org-row { color: #fff; }
 .ws-tab .ws-sub .sev-warn { color: var(--warn); }
 .ws-tab .ws-sub .sev-crit { color: var(--error); }
 .ws-approve-badge { margin-left: 6px; color: var(--error); font-weight: 700; font-size: 11px; }
