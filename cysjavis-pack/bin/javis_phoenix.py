@@ -2036,38 +2036,73 @@ def _is_codex_agent(socket, surface):
     return isinstance(row, dict) and row.get("agent") == "codex"
 
 
-# cysd 내장 rate_limited 룰과 동일 패턴(src/bin/cysd/state.rs:5753-5755 그대로 이식 — 새로 추측하지
-# 않는다). 화면에 이 문면이 보이면 에이전트가 사용량 제한 모달에 갇혀 ACK 를 낼 수 없는 상태다.
-_RATE_LIMITED_SCREEN_RE = re.compile(r"(?i)rate.?limit(ed)?|too many requests|\b429\b")
+# cysd 내장 rate_limited 룰과 동일 패턴(src/bin/cysd/state.rs:5753-5755 그대로 이식) +
+# ★2026-09-30 실측(master가 cys read-screen 으로 직접 확인, 본부 surface:171·부서 surface:131,
+# Claude 좌석): "You've hit your session limit · resets 10:20pm", "Usage limit reached",
+# "⚠ Usage limit reached · limit resets". 추측 없이 실측 문면 그대로 옮김(§3-b 환각 방지).
+_RATE_LIMITED_SCREEN_RE = re.compile(
+    r"(?i)rate.?limit(ed)?|too many requests|\b429\b|usage limit reached|hit your session limit")
+# ★2026-10-01(master diff 검토 ②): 화면 텍스트 전체를 검사하면 스크롤백에 남은 지침 본문·과거
+# [alert] 로그 줄에 오탐할 수 있다 — 방금 렌더된 화면 하단 최근 N줄만 본다.
+_RATE_LIMIT_SCREEN_TAIL_LINES = 15
+
+
+def _screen_tail(text, n=_RATE_LIMIT_SCREEN_TAIL_LINES):
+    return "\n".join((text or "").splitlines()[-n:])
 
 
 def classify_reinject_failure(socket, surface):
     """ACK 미수신(noack/fail/unknown) 뒤 '진짜 재시도 가능한 시간초과'인지 판별(요구 2 · 2026-09-30).
-    순서: 사용량 제한(화면 실측) → agent 부재(경합 재확인) → timeout(진짜 시간초과 — 재주입 가).
-    ACL 거부는 CLI rc/stderr 로 이미 판별되므로(`classify_reinject_result`==acl_denied) 호출부가
-    이 함수 전에 먼저 갈라낸다 — 여기서는 다루지 않는다."""
+    순서: 사용량 제한(화면 실측 · 최근 %d줄만) → agent 부재(경합 재확인) → timeout(진짜 시간초과 —
+    재주입 가). ACL 거부는 CLI rc/stderr 로 이미 판별되므로(`classify_reinject_result`==acl_denied)
+    호출부가 이 함수 전에 먼저 갈라낸다 — 여기서는 다루지 않는다.""" % _RATE_LIMIT_SCREEN_TAIL_LINES
     r = cys("read-screen", "--surface", surface, socket=socket, timeout=10)
-    if r.returncode == 0 and _RATE_LIMITED_SCREEN_RE.search(r.stdout or ""):
+    if r.returncode == 0 and _RATE_LIMITED_SCREEN_RE.search(_screen_tail(r.stdout)):
         return "rate_limited"
     if _surface_agent_present(socket, surface) is False:
         return "not_ready"
     return "timeout"
 
 
+# ★2026-10-01(master diff 검토 ①): journal(예: ticket="default")은 로그인·재부팅을 넘어 재사용되는데
+# stage 완료는 daemon epoch(Phase6 `mark_stage`/`stage_done`)로 무효화된다. 아래 두 헬퍼는 이번에
+# 신설한 실행단위 플래그(acl_delegated·reinject_delivered·g2_acked·reinject_manual_check_required·
+# reinject_injected_this_epoch)를 **같은 규칙으로** 현재 epoch 에 결박한다 — epoch 없이 남기면
+# 다음 로그인부터 예를 들어 부서장 위임이 영구 생략되는 등 조용히 고착된다(마스터 실측 지적).
+def _mark_epoch_flag(rr, key):
+    ent = {"value": True, "ts": _now()}
+    if _ACTIVE_EPOCH is not None:
+        ent["epoch"] = _ACTIVE_EPOCH
+    rr[key] = ent
+
+
+def _epoch_flag_done(rr, key):
+    ent = rr.get(key)
+    if not isinstance(ent, dict) or not ent.get("value"):
+        return False
+    if not EPOCH_GATE:
+        return True
+    if _ACTIVE_EPOCH is None:
+        return False  # 현재 세대 미상 → stage_done 과 동일하게 보수적으로 stale 취급
+    return ent.get("epoch") == _ACTIVE_EPOCH
+
+
 def _delegate_acl_denied(socket, role, surface, ticket, j):
     """ACL 거부(부서 워커 직접 재주입이 `external→worker* deny` 로 막힘)를 부서 master 에 큐 위임
     1회(요구 5 · 2026-09-30). **acl.json 은 손대지 않는다**(오너 명시 금지) — 우회·재시도 없이
-    라벨 붙은 큐 메시지로 부서장에게 넘긴다. `j`(이번 restore 실행의 저널)에 위임 여부를 남겨
-    같은 실행 안에서(F-1 재관측 패스 등) 중복 위임하지 않는다."""
+    라벨 붙은 큐 메시지로 부서장에게 넘긴다. dedup 은 **이번 daemon epoch 안에서만** 유효하다
+    (2026-10-01 수정 — epoch 없이 영속시키면 다음 로그인부터 위임이 영구 생략된다)."""
     rr = j["roles"].setdefault(role, {"stages": {}})
-    if rr.get("acl_delegated"):
-        return True, "delegated=already(dedup, 이번 실행에서 이미 위임함)"
+    if _epoch_flag_done(rr, "acl_delegated"):
+        return True, "delegated=already(dedup, 이번 실행/epoch에서 이미 위임함)"
     msg = ("[위임][phoenix-reinject] 부서 워커 직접 재주입이 ACL(external→worker* deny)로 거부됨 — "
            "role=%s surface=%s ticket=%s. 부서장이 직접 `cys reinject`로 재주입해 주십시오."
            % (role, surface, ticket))
     r = cys("send", "--queued", "--to", "master", msg, socket=socket, timeout=20)
-    rr["acl_delegated"] = bool(r.returncode == 0)
-    return rr["acl_delegated"], "delegated=%s rc=%s" % (rr["acl_delegated"], r.returncode)
+    ok = bool(r.returncode == 0)
+    if ok:
+        _mark_epoch_flag(rr, "acl_delegated")
+    return ok, "delegated=%s rc=%s" % (ok, r.returncode)
 
 
 # ACK 대기 초기값(요구 4 · 2026-09-30): 1차(stage_reinject 핑) 45초 · 2차(stage_g2_ack 핑) 30초.
@@ -2130,12 +2165,23 @@ def stage_reinject(socket, role, surface, stub, j, ticket=""):
         return True, "reinject skip kind=skip: 재확인 결과 agent 없음(경합 · classify_reinject_failure)"
     # 진짜 타임아웃 — 실제 주입 1회 시도.
     rr = j["roles"].setdefault(role, {"stages": {}})
+    # ★2026-10-01(master diff 검토 ③): F-1 재관측 패스가 reinject 단계를 되돌리면(세션 신원 변경 등)
+    # 같은 daemon epoch 안에서 이 함수가 이 역할에 대해 다시 불릴 수 있다. `reinject_delivered`는
+    # 세션 귀속 증거라 F-1 무효화 때 지워지지만(아래 run_restore 의 F-1 블록), 그것과 별개로 '이번
+    # epoch 에 실제 주입 시도를 이미 했는가' 자체는 세션 신원과 무관하게 **지워지지 않고** 남아야
+    # 복원 1회당 실제 주입이 최대 1회로 묶인다 — 그래서 별도 플래그(reinject_injected_this_epoch)를
+    # 쓴다(F-1 무효화 블록이 건드리지 않는 키).
+    if _epoch_flag_done(rr, "reinject_injected_this_epoch"):
+        return True, ("reinject rc=0 kind=manual_check_required: 이번 실행(epoch)에서 이 좌석에 "
+                       "이미 주입을 시도했다 — 재주입 대신 수동 확인 필요(요구 3 · F-1 재관측 중복 "
+                       "주입 방지)")
     if _is_codex_agent(socket, surface):
         # ★2026-10-01 오너 최종 지시: codex 는 자동 재주입·Return 모두 금지 — 붙여넣기·제출을
         # 시도하지 않고 수동 확인 필요로만 기록한다(cys 호출 0회 — inject_text()·화면판정 코드 없음).
-        rr["reinject_manual_check_required"] = True
+        _mark_epoch_flag(rr, "reinject_manual_check_required")
         return True, ("reinject rc=0 kind=manual_check_required: codex 좌석은 자동 재주입·제출을 "
                        "하지 않는다(오너 최종 지시 2026-10-01) — 수동 확인 필요")
+    _mark_epoch_flag(rr, "reinject_injected_this_epoch")  # 시도 자체를 먼저 못박는다(성공 여부와 무관)
     forced = cys("reinject", "--role", role, "--surface", surface,
                  "--timeout", str(REINJECT_ACK_TIMEOUT_1), socket=socket, timeout=REINJECT_ACK_TIMEOUT_1 + 6)
     fkind = classify_reinject_result(forced.returncode, forced.stdout, getattr(forced, "stderr", ""))
@@ -2143,7 +2189,7 @@ def stage_reinject(socket, role, surface, stub, j, ticket=""):
         deleg_ok, deleg_ev = _delegate_acl_denied(socket, role, surface, ticket, j)
         return True, "reinject rc=%s kind=acl_denied %s" % (forced.returncode, deleg_ev)
     if fkind == "injected":
-        rr["reinject_delivered"] = True
+        _mark_epoch_flag(rr, "reinject_delivered")
         h = _reinject_directive_hash(forced.stdout)
         if h:
             rr["reinject_directive_sha256"] = h
@@ -2168,7 +2214,7 @@ def stage_g2_ack(socket, role, surface, stub, j):
     acked = kind == "ack"
     if acked:
         rr = j["roles"].setdefault(role, {"stages": {}})
-        rr["g2_acked"] = True
+        _mark_epoch_flag(rr, "g2_acked")
     return acked, "g2 ack=%s kind=%s (%s)" % (acked, kind, (r.stdout or r.stderr or "").strip()[:120])
 
 
@@ -2881,7 +2927,9 @@ def _run_restore_locked(socket, ticket="default", stub=False, no_breaker=False, 
     reinject_blocked_roles = {}
     for _br in target_roles:
         _rr = j["roles"].get(_br, {}) if isinstance(j.get("roles"), dict) else {}
-        if _rr.get("acl_delegated"):
+        # ★2026-10-01: epoch 결박 플래그이므로 단순 truthy 가 아니라 _epoch_flag_done 으로 읽는다
+        # (dict 는 항상 truthy 라 예전 epoch 의 stale 위임도 여기서 그대로 True 로 새는 사고가 난다).
+        if _epoch_flag_done(_rr, "acl_delegated"):
             reinject_blocked_roles[_br] = "acl_denied_delegated"
             continue
         _rj_ev = ((_rr.get("stages") or {}).get("reinject") or {}).get("evidence") or ""
@@ -2894,8 +2942,9 @@ def _run_restore_locked(socket, ticket="default", stub=False, no_breaker=False, 
     result = {
         "phoenix_restore": final,
         "reinject_blocked_roles": reinject_blocked_roles,
-        "reinject_delivered_roles": [r for r in target_roles if j["roles"].get(r, {}).get("reinject_delivered")],
-        "g2_acked_roles": [r for r in target_roles if j["roles"].get(r, {}).get("g2_acked")],
+        "reinject_delivered_roles": [r for r in target_roles
+                                      if _epoch_flag_done(j["roles"].get(r, {}), "reinject_delivered")],
+        "g2_acked_roles": [r for r in target_roles if _epoch_flag_done(j["roles"].get(r, {}), "g2_acked")],
         "completeness": completeness,          # ★Phase10: readiness 기반 전원 부활 판정
         "incomplete_roles": incomplete_roles,  # ★Phase10: 미부활 역할 정직 명시(침묵 성공 금지)
         "manual_seats": manual_seats,          # ★SEAT: 좌석은 있으나 에이전트 부재(사람 개입 필요) — 정직 명시
