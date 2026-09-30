@@ -45,7 +45,6 @@ spawn(생성) 백엔드 2종:
 import argparse
 import atexit
 import glob
-import hashlib
 import json
 import os
 import re
@@ -2030,75 +2029,16 @@ def _surface_agent_present(socket, surface):
 
 
 def _is_codex_agent(socket, surface):
-    """이 surface 의 agent 가 codex 계열인지(요구 6 은 codex 한정 · 2026-09-30 오너 결정 — claude
-    좌석 동작은 바꾸지 않는다). 조회 불가·비codex는 False(보수적=claude 취급, 기존 경로 유지)."""
+    """이 surface 의 agent 가 codex 계열인지. codex 좌석은 phoenix 복원 경로에서 자동 재주입·제출
+    대상이 아니다(요구 6 · 2026-10-01 오너 최종 지시 — 아래 stage_reinject 의 manual_check_required
+    분기 참고). 조회 불가·비codex는 False(보수적=claude 취급, 기존 경로 유지)."""
     row = _surface_status_row(socket, surface)
     return isinstance(row, dict) and row.get("agent") == "codex"
 
 
-# ★2026-09-30(오너 실측 근거 — master가 cys read-screen 으로 직접 확인, 본부 surface:166·부서
-# surface:130): codex 입력줄 미제출 붙여넣기 문면 = "› [Pasted Content 36242 chars]"(본부) /
-# "› [Pasted Content 36503 chars]"(부서), 빈 입력줄 = "› Ask Codex to do anything". 표시 문자수는
-# 실제 주입 바이트수(원장 36618/36916)와 일치하지 않는다고 오너가 명시 확인했으므로 문자수 대조는
-# 절대 쓰지 않는다(오너 명시 지시 · 추측·환각 방지). 정규식은 이 실측 문면을 그대로 옮긴 것이다.
-_CODEX_EMPTY_INPUT_RE = re.compile(r"^›\s*Ask Codex to do anything\s*$")
-_CODEX_PASTED_ONLY_RE = re.compile(r"^›\s*\[Pasted Content \d+ chars\]\s*$")
 # cysd 내장 rate_limited 룰과 동일 패턴(src/bin/cysd/state.rs:5753-5755 그대로 이식 — 새로 추측하지
 # 않는다). 화면에 이 문면이 보이면 에이전트가 사용량 제한 모달에 갇혀 ACK 를 낼 수 없는 상태다.
 _RATE_LIMITED_SCREEN_RE = re.compile(r"(?i)rate.?limit(ed)?|too many requests|\b429\b")
-
-
-def _codex_last_prompt_line(screen_text):
-    """화면 텍스트에서 codex 입력줄(맨 아래 '›' 접두 줄)을 뽑는다. 없으면 None(판독 불가 — 안전측
-    실패로 다룬다. §3-b 할루시네이션 방지: 모르면 '알 수 없음'이지 '비어있다'로 단정하지 않는다)."""
-    lines = [ln.strip() for ln in (screen_text or "").splitlines() if ln.lstrip().startswith("›")]
-    return lines[-1] if lines else None
-
-
-def _codex_safe_paste_and_submit(socket, role, surface, timeout=25):
-    """codex 좌석 전용 안전 붙여넣기+제출(요구 6 A안 보강 · 2026-09-30 오너 결정, 근거 위 두 정규식
-    주석 참조). `inject_text()`(cys.rs)는 붙여넣기+Return 을 단일 서브프로세스 호출 안에서 원자
-    처리해 파이썬이 그 사이에 개입할 수 없다(inject_text 는 공유 코드라 손대지 말라는 오너 지시) —
-    그래서 이 함수는 `cys send`(붙여넣기만·제출 안 함)와 `cys send-key Return`(제출만)을 분리
-    호출해 그 사이에 화면을 검사한다. 3규칙(오너 결정 그대로):
-      ① 주입 **직전** 입력줄이 빈 placeholder 가 아니거나 판독 불가면 주입 자체를 하지 않는다
-         (이미 뭔가 있다는 뜻 — 다른 미제출 텍스트일 수 있다).
-      ② 주입 **직후** 입력줄이 "[Pasted Content N chars]" 하나만이고 다른 텍스트가 없을 때에만
-         (①로 직전이 비어있었음을 증명했으므로 그 placeholder 는 이번 자동화 것이 확실) Return 1회.
-      ③ 그 외(직전 비어있지 않음 · 직후 불일치 · 판독 불가)는 Return 을 보내지 않고 user_action_required.
-    반환 (ok, evidence). ok=False 이고 evidence 에 'user_action_required' 가 있으면 사람 개입 필요
-    (호출부는 재시도하지 않는다 — §9 처럼 무리한 재시도 금지)."""
-    directive_r = cys("reinject", "--role", role, "--print-only", socket=socket, timeout=10)
-    if directive_r.returncode != 0 or not (directive_r.stdout or "").strip():
-        return False, ("user_action_required: directive 조회 실패(rc=%s) — 붙여넣기 시도 안 함"
-                        % directive_r.returncode)
-    directive = directive_r.stdout
-
-    pre = cys("read-screen", "--surface", surface, socket=socket, timeout=10)
-    pre_line = _codex_last_prompt_line(pre.stdout)
-    if pre.returncode != 0 or pre_line is None or not _CODEX_EMPTY_INPUT_RE.match(pre_line):
-        return False, ("user_action_required: 주입 전 입력줄이 비어있지 않거나 판독 불가(사전확인①) "
-                        "line=%r rc=%s" % (pre_line, pre.returncode))
-
-    send_r = cys("send", "--surface", surface, directive, socket=socket, timeout=timeout)
-    combined = (send_r.stdout or "") + (getattr(send_r, "stderr", "") or "")
-    if _REINJECT_ACL_DENIED_RE.search(combined):
-        return False, "acl_denied: codex 붙여넣기 거부 rc=%s %s" % (send_r.returncode, combined.strip()[:120])
-    if send_r.returncode != 0:
-        return False, "fail: codex 붙여넣기 실패 rc=%s %s" % (send_r.returncode, combined.strip()[:120])
-
-    time.sleep(0.8)  # inject_text() 의 붙여넣기→제출 사이 정착 대기(cys.rs 800ms)와 동일 간격
-    post = cys("read-screen", "--surface", surface, socket=socket, timeout=10)
-    post_line = _codex_last_prompt_line(post.stdout)
-    if post.returncode != 0 or post_line is None or not _CODEX_PASTED_ONLY_RE.match(post_line):
-        return False, ("user_action_required: 붙여넣기 후 입력줄이 placeholder 단독이 아님(②③ 불충족 —"
-                        " 추가텍스트·여러 placeholder·판독 불가) line=%r — 제출 Return 보류" % post_line)
-
-    key_r = cys("send-key", "--surface", surface, "Return", socket=socket, timeout=10)
-    if key_r.returncode != 0:
-        return False, "fail: 제출 Return 실패 rc=%s" % key_r.returncode
-    directive_hash = hashlib.sha256(directive.encode("utf-8")).hexdigest()
-    return True, "reinject rc=0 kind=injected codex-safe-paste directive_sha256=%s" % directive_hash
 
 
 def classify_reinject_failure(socket, surface):
@@ -2146,8 +2086,8 @@ def _reinject_jevent_status(ok, evidence):
         return "rate_limited"
     if "kind=acl_denied" in ev:
         return "acl_delegated" if "delegated=True" in ev else "acl_denied"
-    if "user_action_required" in ev:
-        return "user_action_required"
+    if "manual_check_required" in ev:
+        return "manual_check_required"
     if "kind=queued" in ev:
         return "queued"
     return "ok" if ok else "warn"
@@ -2159,7 +2099,12 @@ def stage_reinject(socket, role, surface, stub, j, ticket=""):
     막는다(2차 핸드셰이크는 `stage_g2_ack`이 핑만 한다 — 절대 주입하지 않는다). 요구 2: 진짜
     시간초과일 때만 재주입 — 사용량 제한·ACL 거부·agent 부재는 재주입하지 않는다. 요구 3: 실제
     주입(delivered)과 ACK(acked)를 저널에 별도 필드로 남긴다(전송 성공≠ACK). 요구 5: ACL 거부는
-    부서 master 위임. 요구 6: codex 좌석은 안전 붙여넣기 경로(`_codex_safe_paste_and_submit`).
+    부서 master 위임.
+    ★요구 6(2026-10-01 오너 최종 지시 — 직전 A안 보강 지시 철회): codex 계열 좌석은 phoenix 복원
+    경로에서 ①지침 자동 재주입을 하지 않는다 ②추가 Return 도 보내지 않는다 ③ACK 확인 핑만 허용,
+    ACK 없으면 주입 대신 'manual_check_required'로 기록한다(read-screen 기반 입력줄 판정 코드는
+    쓰지 않는다 — inject_text()·launch-agent 등 최초 기동 경로도 불변). codex 제출 보호 자체는
+    별도 티켓으로 남는다(이 함수는 그 티켓이 올 때까지 codex 를 손대지 않는다는 뜻).
     ★WP-11 agent-gate: agent=None 빈 셸엔 각성 핑을 쏘지 않는다(zsh 오해석 에러 차단)."""
     if _surface_agent_present(socket, surface) is False:
         return True, "reinject skip kind=skip: agent 없음(빈 셸) — 각성 핑 미발사(WP-11 agent-gate)"
@@ -2186,13 +2131,11 @@ def stage_reinject(socket, role, surface, stub, j, ticket=""):
     # 진짜 타임아웃 — 실제 주입 1회 시도.
     rr = j["roles"].setdefault(role, {"stages": {}})
     if _is_codex_agent(socket, surface):
-        ok, ev = _codex_safe_paste_and_submit(socket, role, surface, timeout=REINJECT_ACK_TIMEOUT_1)
-        if ok:
-            rr["reinject_delivered"] = True
-            h = _reinject_directive_hash(ev)
-            if h:
-                rr["reinject_directive_sha256"] = h
-        return ok, "reinject %s" % ev
+        # ★2026-10-01 오너 최종 지시: codex 는 자동 재주입·Return 모두 금지 — 붙여넣기·제출을
+        # 시도하지 않고 수동 확인 필요로만 기록한다(cys 호출 0회 — inject_text()·화면판정 코드 없음).
+        rr["reinject_manual_check_required"] = True
+        return True, ("reinject rc=0 kind=manual_check_required: codex 좌석은 자동 재주입·제출을 "
+                       "하지 않는다(오너 최종 지시 2026-10-01) — 수동 확인 필요")
     forced = cys("reinject", "--role", role, "--surface", surface,
                  "--timeout", str(REINJECT_ACK_TIMEOUT_1), socket=socket, timeout=REINJECT_ACK_TIMEOUT_1 + 6)
     fkind = classify_reinject_result(forced.returncode, forced.stdout, getattr(forced, "stderr", ""))
@@ -2944,8 +2887,8 @@ def _run_restore_locked(socket, ticket="default", stub=False, no_breaker=False, 
         _rj_ev = ((_rr.get("stages") or {}).get("reinject") or {}).get("evidence") or ""
         if "ratelimited" in _rj_ev:
             reinject_blocked_roles[_br] = "rate_limited"
-        elif "user_action_required" in _rj_ev:
-            reinject_blocked_roles[_br] = "user_action_required"
+        elif "manual_check_required" in _rj_ev:
+            reinject_blocked_roles[_br] = "manual_check_required"  # 요구 6(2026-10-01): codex 좌석
         elif "kind=skip" in _rj_ev:
             reinject_blocked_roles[_br] = "no_agent"
     result = {

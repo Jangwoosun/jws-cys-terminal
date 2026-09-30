@@ -229,11 +229,6 @@ enum Command {
         /// 1차 주입을 중복하지 않게 함). --check 없이 쓰면 무의미(항상 무조건 주입).
         #[arg(long)]
         no_inject: bool,
-        /// 합성된 디렉티브 전문을 **어떤 surface·RPC도 건드리지 않고** stdout에 인쇄만 하고 끝낸다
-        /// (--role 필수 · --surface/--check/--no-inject 무시). 호출부가 붙여넣기·제출 Return을
-        /// 스스로 통제해야 할 때(예: 에이전트별 붙여넣기 제출 안전판정) 본문을 얻는 용도.
-        #[arg(long)]
-        print_only: bool,
     },
     /// T3-14 완료 대기: scrollback 라인이 regex에 매칭될 때까지 블로킹 (plain-line 마커 규약)
     Watch {
@@ -3885,8 +3880,8 @@ fn run(command: Command) -> i32 {
             return run_restore(cwd, include_master, no_resume)
         }
 
-        Command::Reinject { role, surface, check, timeout, no_inject, print_only } => {
-            return run_reinject(role, surface, check, timeout, no_inject, print_only)
+        Command::Reinject { role, surface, check, timeout, no_inject } => {
+            return run_reinject(role, surface, check, timeout, no_inject)
         }
 
         Command::Watch { surface, to, until, timeout, since } => {
@@ -17511,25 +17506,7 @@ fn run_reinject(
     check: bool,
     timeout: u64,
     no_inject: bool,
-    print_only: bool,
 ) -> i32 {
-    if print_only {
-        // ★2026-09-30(오너 예외 승인): surface·RPC 완전 우회 — compose_directive는 파일만 읽는
-        // 순수 조회라, 살아있지 않은/거부되는 좌석에도 안전하게 본문을 얻을 수 있다.
-        return match role
-            .ok_or_else(|| "print-only는 --role 필수".to_string())
-            .and_then(|r| compose_directive(&r))
-        {
-            Ok(directive) => {
-                print!("{directive}");
-                0
-            }
-            Err(e) => {
-                eprintln!("error: {e}");
-                1
-            }
-        };
-    }
     let result = (|| -> Result<(), String> {
         let sid = resolve_role_or_surface(&role, &surface)?;
         let entry = surface_entry(sid)?;

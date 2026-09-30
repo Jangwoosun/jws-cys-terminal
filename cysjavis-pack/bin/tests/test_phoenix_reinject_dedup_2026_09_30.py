@@ -10,8 +10,10 @@
   ① javis_phoenix.py stage_reinject(6s)·stage_g2_ack(4s) 가 둘 다 `cys reinject --check` 를 불러
      ACK 미수신 시 각각 폴백 전문을 주입해 좌석당 재주입이 중복됐다.
   ② dept worker 주입은 acl_denied(external→worker)로 실패했는데 구분 없이 일반 fail 로 처리됐다.
-  ③ codex 는 2차 재주입 붙여넣기가 미제출로 남았다(붙여넣기+Return 이 원자 처리되는 inject_text()
-     에 파이썬이 개입할 수 없어 A안 보강 — 2026-09-30 오너 결정 회신 참고).
+  ③ codex 는 2차 재주입 붙여넣기가 미제출로 남았다. ★2026-10-01 오너 최종 지시로 A안 보강(화면
+     기반 입력줄 안전판정)은 철회됐다 — codex 좌석은 phoenix 복원 경로에서 자동 재주입·추가 Return
+     을 아예 하지 않고 ACK 미수신 시 manual_check_required 만 기록한다. codex 제출 보호 자체는
+     별도 티켓으로 분리됐다(이 파일의 시나리오⑥은 '아무것도 안 한다'만 검증한다).
   ④ 빈 셸(agent 없음)은 'ok'로 조용히 skip 돼 실패가 저널·보고에 드러나지 않았다.
 
 실행: python3 cysjavis-pack/bin/tests/test_phoenix_reinject_dedup_2026_09_30.py  (0=전건 PASS)
@@ -205,62 +207,67 @@ def scenario_5_empty_shell_surfaced_not_silent():
         m.cys = orig
 
 
-# ── ⑥ codex: 기존 입력 보존 — 사용자 텍스트 있으면 Return(및 붙여넣기)을 하지 않는다 ──────────────
-def scenario_6_codex_preserves_existing_input():
+# ── ⑥ Codex 미제출: ACK 미수신 시 codex 좌석은 주입·Return 0회, manual_check_required 기록 ────────
+# ★2026-10-01 오너 최종 지시로 직전 A안 보강(붙여넣기 안전판정) 지시는 철회됐다 — codex 는 phoenix
+# 복원 경로에서 ①자동 재주입 ②추가 Return 을 아예 하지 않는다(read-screen 기반 입력줄 판정 코드
+# 없음). 요구 6(codex 제출 보호)은 별도 티켓으로 분리됐다.
+def scenario_6_codex_manual_check_required_on_noack():
     calls = []
 
     def fake_cys(*args, socket=None, timeout=25):
         calls.append(args)
         verb = args[0]
-        if verb == "reinject" and "--print-only" in args:
-            return _R(0, "DIRECTIVE BODY")
+        if verb == "status":
+            return _R(0, _status_stdout(_status_row(agent="codex")))
+        if verb == "reinject" and "--check" in args:
+            return _R(0, "각성 핑 무응답 — no-inject 모드(주입 생략) (45s) surface:7")
         if verb == "read-screen":
-            # 실측 문면과 다른, 뭔가 다른 텍스트가 이미 입력줄에 있다(사용자가 타이핑 중이었을 수 있음).
-            return _R(0, "› 이미 뭔가 타이핑된 텍스트\n")
-        raise AssertionError("사전확인 실패 뒤 붙여넣기/제출을 시도하면 안 된다: %r" % (args,))
+            return _R(0, "bypass permissions on")  # 사용량 제한 문면 없음 → 진짜 timeout 분류
+        raise AssertionError(
+            "codex 좌석은 ACK 미수신 시 주입·send·send-key 를 전혀 호출하면 안 된다: %r" % (args,))
 
     orig = m.cys
     m.cys = fake_cys
     try:
-        ok, ev = m._codex_safe_paste_and_submit("sock", "worker-1", "surface:7")
-        check("⑥ 입력줄이 비어있지 않으면 붙여넣기 자체를 하지 않는다", not ok, ev)
-        check("⑥ user_action_required 로 기록된다", "user_action_required" in ev, ev)
-        check("⑥ send/send-key 호출이 전혀 없다(본문만 조회+화면 1회 확인)",
+        j = {"roles": {}}
+        ok, ev = m.stage_reinject("sock", "worker-1", "surface:7", False, j, ticket="t1")
+        check("⑥ codex ACK 미수신 → 실패 아니라 확정된 상태(재시도 루프 없음)", ok, ev)
+        check("⑥ evidence 에 manual_check_required 명시", "manual_check_required" in ev, ev)
+        check("⑥ 저널에 reinject_manual_check_required=True 기록",
+              j["roles"]["worker-1"].get("reinject_manual_check_required") is True, str(j["roles"]))
+        check("⑥ delivered 플래그 없음(주입 안 함)",
+              not j["roles"]["worker-1"].get("reinject_delivered"), str(j["roles"]))
+        check("⑥ 폴백 주입(reinject --check 없는 호출) 0회",
+              not any(c[0] == "reinject" and "--check" not in c for c in calls), str(calls))
+        check("⑥ send/send-key 호출 0회(Return 도 전혀 보내지 않음)",
               not any(c[0] in ("send", "send-key") for c in calls), str(calls))
+        status = m._reinject_jevent_status(ok, ev)
+        check("⑥ jevent status 가 manual_check_required 로 구분된다", status == "manual_check_required", status)
     finally:
         m.cys = orig
 
 
-def scenario_6b_codex_empty_input_then_safe_submit():
-    """대조군: 직전이 실측 그대로의 빈 placeholder면 붙여넣기→직후 단독 placeholder 확인 후 Return 1회."""
+def scenario_6b_codex_ack_short_circuits_before_manual_check():
+    """대조군: codex 도 ACK 만 받으면(이미 살아있으면) manual_check_required 로 가지 않는다."""
     calls = []
-    screens = ["› Ask Codex to do anything", "› [Pasted Content 36242 chars]"]
 
     def fake_cys(*args, socket=None, timeout=25):
         calls.append(args)
         verb = args[0]
-        if verb == "reinject" and "--print-only" in args:
-            return _R(0, "DIRECTIVE BODY")
-        if verb == "read-screen":
-            return _R(0, screens.pop(0) if screens else screens[-1])
-        if verb == "send" and "--surface" in args:
-            return _R(0, "OK")
-        if verb == "send-key":
-            check("⑥b Return 은 정확히 한 번, 붙여넣기 이후에만", args[-1] == "Return", str(args))
-            return _R(0, "OK")
-        raise AssertionError("unexpected cys call: %r" % (args,))
+        if verb == "status":
+            return _R(0, _status_stdout(_status_row(agent="codex")))
+        if verb == "reinject" and "--check" in args:
+            return _R(0, "디렉티브 생존 확인 (ACK 수신) — 재주입 불필요")
+        raise AssertionError("ACK 수신 뒤 추가 cys 호출이 있으면 안 된다: %r" % (args,))
 
-    orig, orig_sleep = m.cys, m.time.sleep
+    orig = m.cys
     m.cys = fake_cys
-    m.time.sleep = lambda s: None
     try:
-        ok, ev = m._codex_safe_paste_and_submit("sock", "worker-1", "surface:7")
-        check("⑥b 직전 비어있음 실증 후 붙여넣기+제출 성공", ok, ev)
-        check("⑥b evidence 에 kind=injected", "kind=injected" in ev, ev)
-        send_keys = [c for c in calls if c[0] == "send-key"]
-        check("⑥b send-key(Return) 정확히 1회", len(send_keys) == 1, str(send_keys))
+        j = {"roles": {}}
+        ok, ev = m.stage_reinject("sock", "worker-1", "surface:7", False, j, ticket="t1")
+        check("⑥b codex ACK 수신 → 성공(manual_check_required 아님)", ok and "manual_check_required" not in ev, ev)
     finally:
-        m.cys, m.time.sleep = orig, orig_sleep
+        m.cys = orig
 
 
 def main():
@@ -269,8 +276,8 @@ def main():
     scenario_3_acl_denied_delegates_once()
     scenario_4_rate_limited_screen_blocks_injection()
     scenario_5_empty_shell_surfaced_not_silent()
-    scenario_6_codex_preserves_existing_input()
-    scenario_6b_codex_empty_input_then_safe_submit()
+    scenario_6_codex_manual_check_required_on_noack()
+    scenario_6b_codex_ack_short_circuits_before_manual_check()
 
     npass = sum(1 for c in _results if c)
     print("\n=== %d/%d PASS ===" % (npass, len(_results)))
