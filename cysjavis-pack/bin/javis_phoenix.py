@@ -45,6 +45,7 @@ spawn(생성) 백엔드 2종:
 import argparse
 import atexit
 import glob
+import hashlib
 import json
 import os
 import re
@@ -343,16 +344,31 @@ _REINJECT_ACK_LINE_RE = re.compile(r"(?m)^디렉티브 생존 확인 \(ACK 수�
 _REINJECT_INJECTED_LINE_RE = re.compile(r"(?m)^reinjected \d+ bytes → surface:")
 _REINJECT_SKIP_LINE_RE = re.compile(r"(?m)check reinject skip")
 _REINJECT_NOACK_RE = re.compile(r"\[reinject\] ACK 없음")
+# ★2026-09-30(오너 예외 승인 · phoenix 재주입 중복 재발방지): `--no-inject` 핑 전용 결과 줄
+# (src/bin/cys.rs run_reinject) — ACK 못 받았지만 폴백 주입을 하지 않았다는 뜻(요구 1).
+_REINJECT_NOACK_NOINJECT_LINE_RE = re.compile(r"(?m)^각성 핑 무응답 — no-inject 모드")
+# 주입된 본문의 sha256(cys.rs `reinjected N bytes → surface:S (role) directive_sha256=<hex>`).
+_REINJECT_DIRECTIVE_HASH_RE = re.compile(
+    r"(?m)^reinjected \d+ bytes → surface:\S+ \([^)]*\) directive_sha256=([0-9a-f]{64})"
+)
+# cysd 의 acl_denied 오류 문면(src/bin/cysd/handlers.rs · 예: "error: acl_denied: acl denied:
+# external → worker-1 (pack/acl.json)"). rc!=0 일 때만 등장하므로 fail 세분류로만 쓴다.
+_REINJECT_ACL_DENIED_RE = re.compile(r"acl_denied")
 
 
 def classify_reinject_result(rc, stdout, stderr):
     """`cys reinject --check` 결과 → 구조화 증거 종류(리뷰 R1 · R1b 강화). 판독은 CLI 의 **줄 단위** 문면만 본다 —
     부분 문자열(종전 `"ACK" in out`)은 role 이름(`… (BACKEND)`) 같은 임의 텍스트에 위조됐다(codex major).
-    순서(fail-closed): rc≠0=fail → stderr 의 큐 전환(`--queued`)은 **어느 양성 종류보다 먼저** queued(배달 예약은
-    증거 아님) → ack 줄 ∧ `ACK 없음` 동반(한 호출에서 상호배제 · 모순 출력) = unknown → ack → injected → skip → unknown."""
+    순서(fail-closed): rc≠0 → acl_denied 세분류 우선, 아니면 fail → stderr 의 큐 전환(`--queued`)은 **어느
+    양성 종류보다 먼저** queued(배달 예약은 증거 아님) → ack 줄 ∧ `ACK 없음` 동반(한 호출에서 상호배제 ·
+    모순 출력) = unknown → ack → injected → noack(--no-inject 핑 전용 결과) → skip → unknown."""
     out = stdout or ""
     err = stderr or ""
     if rc != 0:
+        # ★2026-09-30: ACL 거부(부서 워커 직접 주입 차단)는 일반 fail 과 구분한다 — 재시도가 아니라
+        # 부서 master 위임 대상이다(요구 2·5). rc!=0 인 다른 사유(연결 실패 등)는 그대로 fail.
+        if _REINJECT_ACL_DENIED_RE.search(out) or _REINJECT_ACL_DENIED_RE.search(err):
+            return "acl_denied"
         return "fail"
     if "--queued" in err:
         return "queued"
@@ -363,9 +379,18 @@ def classify_reinject_result(rc, stdout, stderr):
         return "ack"
     if _REINJECT_INJECTED_LINE_RE.search(out):
         return "injected"
+    if _REINJECT_NOACK_NOINJECT_LINE_RE.search(out):
+        return "noack"
     if _REINJECT_SKIP_LINE_RE.search(out):
         return "skip"
     return "unknown"
+
+
+def _reinject_directive_hash(stdout):
+    """`classify_reinject_result`==injected 인 stdout 에서 주입 본문 sha256 을 뽑는다(요구 3 전달이력 키).
+    표기 부재(구판 CLI·미주입)=None."""
+    m = _REINJECT_DIRECTIVE_HASH_RE.search(stdout or "")
+    return m.group(1) if m else None
 
 
 #   stage_reinject 가 쓰는 두 형식만 인정(`reinject rc=<n> kind=<k> …` · `reinject skip kind=skip: …`) · 종류 뒤에 경계 요구
@@ -2004,29 +2029,204 @@ def _surface_agent_present(socket, surface):
     return None
 
 
-def stage_reinject(socket, role, surface, stub):
-    """디렉티브 재주입 — reinject --check 재사용(각성 핑 후 필요 시 주입).
+def _is_codex_agent(socket, surface):
+    """이 surface 의 agent 가 codex 계열인지(요구 6 은 codex 한정 · 2026-09-30 오너 결정 — claude
+    좌석 동작은 바꾸지 않는다). 조회 불가·비codex는 False(보수적=claude 취급, 기존 경로 유지)."""
+    row = _surface_status_row(socket, surface)
+    return isinstance(row, dict) and row.get("agent") == "codex"
+
+
+# ★2026-09-30(오너 실측 근거 — master가 cys read-screen 으로 직접 확인, 본부 surface:166·부서
+# surface:130): codex 입력줄 미제출 붙여넣기 문면 = "› [Pasted Content 36242 chars]"(본부) /
+# "› [Pasted Content 36503 chars]"(부서), 빈 입력줄 = "› Ask Codex to do anything". 표시 문자수는
+# 실제 주입 바이트수(원장 36618/36916)와 일치하지 않는다고 오너가 명시 확인했으므로 문자수 대조는
+# 절대 쓰지 않는다(오너 명시 지시 · 추측·환각 방지). 정규식은 이 실측 문면을 그대로 옮긴 것이다.
+_CODEX_EMPTY_INPUT_RE = re.compile(r"^›\s*Ask Codex to do anything\s*$")
+_CODEX_PASTED_ONLY_RE = re.compile(r"^›\s*\[Pasted Content \d+ chars\]\s*$")
+# cysd 내장 rate_limited 룰과 동일 패턴(src/bin/cysd/state.rs:5753-5755 그대로 이식 — 새로 추측하지
+# 않는다). 화면에 이 문면이 보이면 에이전트가 사용량 제한 모달에 갇혀 ACK 를 낼 수 없는 상태다.
+_RATE_LIMITED_SCREEN_RE = re.compile(r"(?i)rate.?limit(ed)?|too many requests|\b429\b")
+
+
+def _codex_last_prompt_line(screen_text):
+    """화면 텍스트에서 codex 입력줄(맨 아래 '›' 접두 줄)을 뽑는다. 없으면 None(판독 불가 — 안전측
+    실패로 다룬다. §3-b 할루시네이션 방지: 모르면 '알 수 없음'이지 '비어있다'로 단정하지 않는다)."""
+    lines = [ln.strip() for ln in (screen_text or "").splitlines() if ln.lstrip().startswith("›")]
+    return lines[-1] if lines else None
+
+
+def _codex_safe_paste_and_submit(socket, role, surface, timeout=25):
+    """codex 좌석 전용 안전 붙여넣기+제출(요구 6 A안 보강 · 2026-09-30 오너 결정, 근거 위 두 정규식
+    주석 참조). `inject_text()`(cys.rs)는 붙여넣기+Return 을 단일 서브프로세스 호출 안에서 원자
+    처리해 파이썬이 그 사이에 개입할 수 없다(inject_text 는 공유 코드라 손대지 말라는 오너 지시) —
+    그래서 이 함수는 `cys send`(붙여넣기만·제출 안 함)와 `cys send-key Return`(제출만)을 분리
+    호출해 그 사이에 화면을 검사한다. 3규칙(오너 결정 그대로):
+      ① 주입 **직전** 입력줄이 빈 placeholder 가 아니거나 판독 불가면 주입 자체를 하지 않는다
+         (이미 뭔가 있다는 뜻 — 다른 미제출 텍스트일 수 있다).
+      ② 주입 **직후** 입력줄이 "[Pasted Content N chars]" 하나만이고 다른 텍스트가 없을 때에만
+         (①로 직전이 비어있었음을 증명했으므로 그 placeholder 는 이번 자동화 것이 확실) Return 1회.
+      ③ 그 외(직전 비어있지 않음 · 직후 불일치 · 판독 불가)는 Return 을 보내지 않고 user_action_required.
+    반환 (ok, evidence). ok=False 이고 evidence 에 'user_action_required' 가 있으면 사람 개입 필요
+    (호출부는 재시도하지 않는다 — §9 처럼 무리한 재시도 금지)."""
+    directive_r = cys("reinject", "--role", role, "--print-only", socket=socket, timeout=10)
+    if directive_r.returncode != 0 or not (directive_r.stdout or "").strip():
+        return False, ("user_action_required: directive 조회 실패(rc=%s) — 붙여넣기 시도 안 함"
+                        % directive_r.returncode)
+    directive = directive_r.stdout
+
+    pre = cys("read-screen", "--surface", surface, socket=socket, timeout=10)
+    pre_line = _codex_last_prompt_line(pre.stdout)
+    if pre.returncode != 0 or pre_line is None or not _CODEX_EMPTY_INPUT_RE.match(pre_line):
+        return False, ("user_action_required: 주입 전 입력줄이 비어있지 않거나 판독 불가(사전확인①) "
+                        "line=%r rc=%s" % (pre_line, pre.returncode))
+
+    send_r = cys("send", "--surface", surface, directive, socket=socket, timeout=timeout)
+    combined = (send_r.stdout or "") + (getattr(send_r, "stderr", "") or "")
+    if _REINJECT_ACL_DENIED_RE.search(combined):
+        return False, "acl_denied: codex 붙여넣기 거부 rc=%s %s" % (send_r.returncode, combined.strip()[:120])
+    if send_r.returncode != 0:
+        return False, "fail: codex 붙여넣기 실패 rc=%s %s" % (send_r.returncode, combined.strip()[:120])
+
+    time.sleep(0.8)  # inject_text() 의 붙여넣기→제출 사이 정착 대기(cys.rs 800ms)와 동일 간격
+    post = cys("read-screen", "--surface", surface, socket=socket, timeout=10)
+    post_line = _codex_last_prompt_line(post.stdout)
+    if post.returncode != 0 or post_line is None or not _CODEX_PASTED_ONLY_RE.match(post_line):
+        return False, ("user_action_required: 붙여넣기 후 입력줄이 placeholder 단독이 아님(②③ 불충족 —"
+                        " 추가텍스트·여러 placeholder·판독 불가) line=%r — 제출 Return 보류" % post_line)
+
+    key_r = cys("send-key", "--surface", surface, "Return", socket=socket, timeout=10)
+    if key_r.returncode != 0:
+        return False, "fail: 제출 Return 실패 rc=%s" % key_r.returncode
+    directive_hash = hashlib.sha256(directive.encode("utf-8")).hexdigest()
+    return True, "reinject rc=0 kind=injected codex-safe-paste directive_sha256=%s" % directive_hash
+
+
+def classify_reinject_failure(socket, surface):
+    """ACK 미수신(noack/fail/unknown) 뒤 '진짜 재시도 가능한 시간초과'인지 판별(요구 2 · 2026-09-30).
+    순서: 사용량 제한(화면 실측) → agent 부재(경합 재확인) → timeout(진짜 시간초과 — 재주입 가).
+    ACL 거부는 CLI rc/stderr 로 이미 판별되므로(`classify_reinject_result`==acl_denied) 호출부가
+    이 함수 전에 먼저 갈라낸다 — 여기서는 다루지 않는다."""
+    r = cys("read-screen", "--surface", surface, socket=socket, timeout=10)
+    if r.returncode == 0 and _RATE_LIMITED_SCREEN_RE.search(r.stdout or ""):
+        return "rate_limited"
+    if _surface_agent_present(socket, surface) is False:
+        return "not_ready"
+    return "timeout"
+
+
+def _delegate_acl_denied(socket, role, surface, ticket, j):
+    """ACL 거부(부서 워커 직접 재주입이 `external→worker* deny` 로 막힘)를 부서 master 에 큐 위임
+    1회(요구 5 · 2026-09-30). **acl.json 은 손대지 않는다**(오너 명시 금지) — 우회·재시도 없이
+    라벨 붙은 큐 메시지로 부서장에게 넘긴다. `j`(이번 restore 실행의 저널)에 위임 여부를 남겨
+    같은 실행 안에서(F-1 재관측 패스 등) 중복 위임하지 않는다."""
+    rr = j["roles"].setdefault(role, {"stages": {}})
+    if rr.get("acl_delegated"):
+        return True, "delegated=already(dedup, 이번 실행에서 이미 위임함)"
+    msg = ("[위임][phoenix-reinject] 부서 워커 직접 재주입이 ACL(external→worker* deny)로 거부됨 — "
+           "role=%s surface=%s ticket=%s. 부서장이 직접 `cys reinject`로 재주입해 주십시오."
+           % (role, surface, ticket))
+    r = cys("send", "--queued", "--to", "master", msg, socket=socket, timeout=20)
+    rr["acl_delegated"] = bool(r.returncode == 0)
+    return rr["acl_delegated"], "delegated=%s rc=%s" % (rr["acl_delegated"], r.returncode)
+
+
+# ACK 대기 초기값(요구 4 · 2026-09-30): 1차(stage_reinject 핑) 45초 · 2차(stage_g2_ack 핑) 30초.
+# ACK 가 먼저 도착하면 `surface.wait_for`(cys.rs)가 즉시 반환한다 — 고정 sleep 아님(불변).
+REINJECT_ACK_TIMEOUT_1 = int(os.environ.get("PHOENIX_REINJECT_ACK_TIMEOUT_1", "45"))
+REINJECT_ACK_TIMEOUT_2 = int(os.environ.get("PHOENIX_REINJECT_ACK_TIMEOUT_2", "30"))
+
+
+def _reinject_jevent_status(ok, evidence):
+    """요구 7(2026-09-30): reinject 단계의 저널 이벤트 status 를 'ok'로 뭉개지 않고 사유별로 구분한다
+    (빈 셸·사용량 제한·ACL 위임·사람개입필요·큐지연을 각각 다른 라벨로 — 조용한 skip 재발 방지)."""
+    ev = evidence or ""
+    if "kind=skip" in ev:
+        return "skip_no_agent"
+    if "ratelimited" in ev:
+        return "rate_limited"
+    if "kind=acl_denied" in ev:
+        return "acl_delegated" if "delegated=True" in ev else "acl_denied"
+    if "user_action_required" in ev:
+        return "user_action_required"
+    if "kind=queued" in ev:
+        return "queued"
+    return "ok" if ok else "warn"
+
+
+def stage_reinject(socket, role, surface, stub, j, ticket=""):
+    """디렉티브 재주입(2026-09-30 재설계 — 오너 예외 승인, phoenix 재주입 중복 재발방지 티켓).
+    요구 1: ACK 확인(`--no-inject` 핑)과 실제 주입을 분리해 이번 실행에서 좌석당 주입을 최대 1회로
+    막는다(2차 핸드셰이크는 `stage_g2_ack`이 핑만 한다 — 절대 주입하지 않는다). 요구 2: 진짜
+    시간초과일 때만 재주입 — 사용량 제한·ACL 거부·agent 부재는 재주입하지 않는다. 요구 3: 실제
+    주입(delivered)과 ACK(acked)를 저널에 별도 필드로 남긴다(전송 성공≠ACK). 요구 5: ACL 거부는
+    부서 master 위임. 요구 6: codex 좌석은 안전 붙여넣기 경로(`_codex_safe_paste_and_submit`).
     ★WP-11 agent-gate: agent=None 빈 셸엔 각성 핑을 쏘지 않는다(zsh 오해석 에러 차단)."""
     if _surface_agent_present(socket, surface) is False:
         return True, "reinject skip kind=skip: agent 없음(빈 셸) — 각성 핑 미발사(WP-11 agent-gate)"
-    r = cys("reinject", "--check", "--role", role, "--surface", surface, "--timeout", "6",
-            socket=socket, timeout=12)
-    # ★F-1(리뷰 R1): 구조화 증거 종류를 증거 문자열에 박는다(`kind=`) — F-1 verify 가 ack|injected 만 인정한다.
-    kind = classify_reinject_result(r.returncode, r.stdout, getattr(r, "stderr", ""))
-    return r.returncode == 0, "reinject rc=%s kind=%s %s" % (r.returncode, kind, (r.stdout or r.stderr or "").strip()[:120])
+    ping = cys("reinject", "--check", "--role", role, "--surface", surface,
+               "--timeout", str(REINJECT_ACK_TIMEOUT_1), "--no-inject",
+               socket=socket, timeout=REINJECT_ACK_TIMEOUT_1 + 6)
+    kind = classify_reinject_result(ping.returncode, ping.stdout, getattr(ping, "stderr", ""))
+    if kind == "ack":
+        # 1차 핑 자체가 ACK 를 받았다 — 이미 살아있는 디렉티브가 확인됐으므로 주입도 g2 도 불필요.
+        return True, "reinject rc=%s kind=%s %s" % (ping.returncode, kind, (ping.stdout or "").strip()[:120])
+    if kind == "acl_denied":
+        deleg_ok, deleg_ev = _delegate_acl_denied(socket, role, surface, ticket, j)
+        return True, "reinject rc=%s kind=acl_denied %s" % (ping.returncode, deleg_ev)
+    if kind == "skip":
+        return True, "reinject skip kind=skip: 재확인 결과 agent 없음(경합)"
+    if kind == "queued":
+        return False, "reinject kind=queued: 사람 입력 감지·핑 지연배달 — 이번 실행에서 재주입 보류"
+    # noack/fail/unknown — 진짜 시간초과인지, 아니면 주입해도 소용없는 상태인지 추가 판별(요구 2).
+    failure = classify_reinject_failure(socket, surface)
+    if failure == "rate_limited":
+        return False, "reinject kind=%s ratelimited: 사용량 제한 화면 감지 — 재주입 보류(요구 2)" % kind
+    if failure == "not_ready":
+        return True, "reinject skip kind=skip: 재확인 결과 agent 없음(경합 · classify_reinject_failure)"
+    # 진짜 타임아웃 — 실제 주입 1회 시도.
+    rr = j["roles"].setdefault(role, {"stages": {}})
+    if _is_codex_agent(socket, surface):
+        ok, ev = _codex_safe_paste_and_submit(socket, role, surface, timeout=REINJECT_ACK_TIMEOUT_1)
+        if ok:
+            rr["reinject_delivered"] = True
+            h = _reinject_directive_hash(ev)
+            if h:
+                rr["reinject_directive_sha256"] = h
+        return ok, "reinject %s" % ev
+    forced = cys("reinject", "--role", role, "--surface", surface,
+                 "--timeout", str(REINJECT_ACK_TIMEOUT_1), socket=socket, timeout=REINJECT_ACK_TIMEOUT_1 + 6)
+    fkind = classify_reinject_result(forced.returncode, forced.stdout, getattr(forced, "stderr", ""))
+    if fkind == "acl_denied":
+        deleg_ok, deleg_ev = _delegate_acl_denied(socket, role, surface, ticket, j)
+        return True, "reinject rc=%s kind=acl_denied %s" % (forced.returncode, deleg_ev)
+    if fkind == "injected":
+        rr["reinject_delivered"] = True
+        h = _reinject_directive_hash(forced.stdout)
+        if h:
+            rr["reinject_directive_sha256"] = h
+    return fkind == "injected", "reinject rc=%s kind=%s %s" % (
+        forced.returncode, fkind, (forced.stdout or forced.stderr or "").strip()[:120])
 
 
-def stage_g2_ack(socket, role, surface, stub):
-    """G2 핸드셰이크 ack — 부활 노드가 원장 대조 핑에 응답하는지(M7). 응답 없으면
-    타임아웃 → unverified 격하 모드로 전진(무한 보류 금지). stub은 응답자가 없으므로
-    best-effort 로 시도만 하고 결과를 저널에 남긴다.
+def stage_g2_ack(socket, role, surface, stub, j):
+    """G2 핸드셰이크 ack — 부활 노드가 원장 대조 핑에 응답하는지(M7). **핑 전용**(`--no-inject`,
+    요구 1) — 응답 없어도 이 함수는 절대 주입하지 않는다(1차 `stage_reinject` 만 주입 담당·좌석당
+    주입 최대 1회). 응답 없으면 타임아웃 → unverified 격하 모드로 전진(무한 보류 금지).
+    ★버그수정(2026-09-30): 종전 ack 판정이 실제 CLI 출력에 없는 '각성'/'awake' 부분문자열을 찾아
+    production 에서 사실상 항상 False 였다(마스터 root-cause) — 검증된 `classify_reinject_result`
+    줄 단위 판독으로 교체했다.
     ★WP-11 agent-gate: agent=None 빈 셸엔 각성 핑을 쏘지 않는다(빈 셸은 ack 주체 없음)."""
     if _surface_agent_present(socket, surface) is False:
         return False, "g2 skip: agent 없음(빈 셸) — 각성 핑 미발사(WP-11 agent-gate)"
-    r = cys("reinject", "--check", "--role", role, "--surface", surface, "--timeout", "4",
-            socket=socket, timeout=10)
-    acked = (r.returncode == 0) and ("각성" in (r.stdout or "") or "awake" in (r.stdout or "").lower())
-    return acked, "g2 ack=%s (%s)" % (acked, (r.stdout or r.stderr or "").strip()[:120])
+    r = cys("reinject", "--check", "--role", role, "--surface", surface,
+            "--timeout", str(REINJECT_ACK_TIMEOUT_2), "--no-inject",
+            socket=socket, timeout=REINJECT_ACK_TIMEOUT_2 + 6)
+    kind = classify_reinject_result(r.returncode, r.stdout, getattr(r, "stderr", ""))
+    acked = kind == "ack"
+    if acked:
+        rr = j["roles"].setdefault(role, {"stages": {}})
+        rr["g2_acked"] = True
+    return acked, "g2 ack=%s kind=%s (%s)" % (acked, kind, (r.stdout or r.stderr or "").strip()[:120])
 
 
 # ------------------------------------------------------------------ restore 상태머신
@@ -2548,8 +2748,11 @@ def _run_restore_locked(socket, ticket="default", stub=False, no_breaker=False, 
                 #   주고, 다음 pass 가 A 의 ACK 를 B 의 증거로 채택했다(codex 재현). 직전=직후=관측일 때만 귀속한다.
                 f1_bind = (not stub) and bool(j["roles"][role].get("fresh_expected"))
                 sid_before = _registered_sid(_surface_status_row(socket, surface)) if f1_bind else None
-                ok, ev = stage_reinject(socket, role, surface, stub)
-                mark_stage(j, role, "reinject", ok, ev); jevent(j, role, "reinject", "ok" if ok else "warn", ev)
+                ok, ev = stage_reinject(socket, role, surface, stub, j, ticket=ticket)
+                mark_stage(j, role, "reinject", ok, ev)
+                # ★요구 7(2026-09-30): 빈 셸/준비실패·사용량제한·ACL위임은 "ok"로 뭉개지 않고
+                # jevent status 에서부터 구분해 저널·보고에 드러낸다(조용한 skip 재발 방지).
+                jevent(j, role, "reinject", _reinject_jevent_status(ok, ev), ev)
                 if f1_bind:
                     sid_after = _registered_sid(_surface_status_row(socket, surface))
                     j["roles"][role]["reinject_sid_before"] = sid_before
@@ -2558,7 +2761,7 @@ def _run_restore_locked(socket, ticket="default", stub=False, no_breaker=False, 
                 save_journal(socket, ticket, j)
             # g2_ack (best-effort; 실패해도 전진하되 verify에서 정직 라벨)
             if not stage_done(j, role, "g2_ack"):
-                ok, ev = stage_g2_ack(socket, role, surface, stub)
+                ok, ev = stage_g2_ack(socket, role, surface, stub, j)
                 mark_stage(j, role, "g2_ack", ok, ev); jevent(j, role, "g2_ack", "ok" if ok else "degraded", ev)
                 save_journal(socket, ticket, j)
             # verify (M9 핵심): observed_sid == expected_sid 이며 비어있지 않아야 VERIFIED
@@ -2606,6 +2809,13 @@ def _run_restore_locked(socket, ticket="default", stub=False, no_breaker=False, 
                             mark_stage(j, role, st, False, "F-1 증거 무효화(%s · 이전 세션 귀속 증거 재사용 금지)" % prov)
                         j["roles"][role].pop("reinject_sid", None)
                         j["roles"][role].pop("reinject_sid_before", None)
+                        # ★요구 3(2026-09-30): 이전 세션의 delivered/acked/위임 기록도 함께 지운다 — 새
+                        # 세션에 이전 세션 기록을 근거로 "이미 전달됨"을 물려주지 않는다(다른 세션 기록으로
+                        # 새 세션 주입을 생략 금지). acl_delegated 는 세션과 무관하게(좌석 ACL 자체가 사유)
+                        # 유지한다 — 새 세션이 떠도 같은 부서 워커라 같은 ACL 이 다시 거부할 것이기 때문.
+                        j["roles"][role].pop("reinject_delivered", None)
+                        j["roles"][role].pop("reinject_directive_sha256", None)
+                        j["roles"][role].pop("g2_acked", None)
                     # ★리뷰 R2: 살아 있는 역할은 다음 restore 의 target 이 아니므로(선재 의미론) 재관측 기회는 **이 실행 안**에
                     #   있어야 한다 — 되돌린 단계를 같은 실행에서 1회(F1_REVERIFY_PASSES) 다시 돈다(무한 루프 0 · 게이트 완화 0).
                     if prov in F1_REOBSERVABLE and not stub:
@@ -2723,8 +2933,26 @@ def _run_restore_locked(socket, ticket="default", stub=False, no_breaker=False, 
                     "대화 재개(타 역할 세션이거나 stale 신원)일 수 있다. 그 좌석의 대화를 확인하고 필요하면 재기동하라."
                     % fresh_fork_suspect_roles)
 
+    # ★요구 2·5·6·7(2026-09-30): reinject 가 막힌 이유를 역할별로 드러낸다(조용한 skip 금지) ·
+    # 요구 3: '전달됨'(delivered)과 'ACK됨'(g2_acked)을 별도로 노출(전송 성공≠ACK 확인).
+    reinject_blocked_roles = {}
+    for _br in target_roles:
+        _rr = j["roles"].get(_br, {}) if isinstance(j.get("roles"), dict) else {}
+        if _rr.get("acl_delegated"):
+            reinject_blocked_roles[_br] = "acl_denied_delegated"
+            continue
+        _rj_ev = ((_rr.get("stages") or {}).get("reinject") or {}).get("evidence") or ""
+        if "ratelimited" in _rj_ev:
+            reinject_blocked_roles[_br] = "rate_limited"
+        elif "user_action_required" in _rj_ev:
+            reinject_blocked_roles[_br] = "user_action_required"
+        elif "kind=skip" in _rj_ev:
+            reinject_blocked_roles[_br] = "no_agent"
     result = {
         "phoenix_restore": final,
+        "reinject_blocked_roles": reinject_blocked_roles,
+        "reinject_delivered_roles": [r for r in target_roles if j["roles"].get(r, {}).get("reinject_delivered")],
+        "g2_acked_roles": [r for r in target_roles if j["roles"].get(r, {}).get("g2_acked")],
         "completeness": completeness,          # ★Phase10: readiness 기반 전원 부활 판정
         "incomplete_roles": incomplete_roles,  # ★Phase10: 미부활 역할 정직 명시(침묵 성공 금지)
         "manual_seats": manual_seats,          # ★SEAT: 좌석은 있으나 에이전트 부재(사람 개입 필요) — 정직 명시

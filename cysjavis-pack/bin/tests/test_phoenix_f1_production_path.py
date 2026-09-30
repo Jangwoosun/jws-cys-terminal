@@ -88,7 +88,10 @@ def scenario(name):
                 stdout = "restored worker-1 surface:7"
             elif verb == "reinject":
                 assert args[:6] == ("reinject", "--check", "--role", "worker-1", "--surface", "surface:7")
-                assert args[6:] in (("--timeout", "6"), ("--timeout", "4"))
+                # ★2026-09-30(오너 예외 승인 · phoenix 재주입 중복 재발방지): ACK 확인과 주입을 분리하는
+                # --no-inject 가 1차(stage_reinject)·2차(stage_g2_ack) 핑 모두에 항상 동반된다(요구 1).
+                # 타임아웃도 45s/30s 로 늘었다(요구 4).
+                assert args[6:] in (("--timeout", "45", "--no-inject"), ("--timeout", "30", "--no-inject"))
                 with open(journal_path, encoding="utf-8") as f:
                     snapshots.append(json.load(f))
                 state["checks"] += 1
@@ -156,8 +159,9 @@ def scenario(name):
         if name in ("S3", "S4", "S5"):
             expected_prov = "unobserved" if name == "S5" else "changed"
             check(name + " same-run reobserve", len(reobserve) == 1 and expected_prov in reobserve[0]["msg"])
-            # Distinguish stage reinject from G2's own reinject --check call.
-            check(name + " recollects injection and G2", sum(args[-1] == "6" for verb, args, socket, timeout in calls
+            # Distinguish stage reinject (45s) from G2's own reinject --check call (30s).
+            # ★2026-09-30: 마지막 인자는 이제 항상 --no-inject 이므로 끝에서 두 번째(timeout 값)로 구분한다.
+            check(name + " recollects injection and G2", sum(args[-2] == "45" for verb, args, socket, timeout in calls
                   if verb == "reinject") == 2 and verbs.count("reinject") == 4)
             retry = snapshots[2]["roles"]["worker-1"]
             check(name + " invalidated old evidence before retry", "reinject_sid" not in retry
