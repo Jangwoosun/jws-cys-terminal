@@ -225,6 +225,15 @@ enum Command {
         check: bool,
         #[arg(long, default_value_t = 30)]
         timeout: u64,
+        /// --check와 함께: ACK 없어도 폴백 전문 주입을 하지 않는다(핑 전용 — 2차 핸드셰이크가
+        /// 1차 주입을 중복하지 않게 함). --check 없이 쓰면 무의미(항상 무조건 주입).
+        #[arg(long)]
+        no_inject: bool,
+        /// 합성된 디렉티브 전문을 **어떤 surface·RPC도 건드리지 않고** stdout에 인쇄만 하고 끝낸다
+        /// (--role 필수 · --surface/--check/--no-inject 무시). 호출부가 붙여넣기·제출 Return을
+        /// 스스로 통제해야 할 때(예: 에이전트별 붙여넣기 제출 안전판정) 본문을 얻는 용도.
+        #[arg(long)]
+        print_only: bool,
     },
     /// T3-14 완료 대기: scrollback 라인이 regex에 매칭될 때까지 블로킹 (plain-line 마커 규약)
     Watch {
@@ -3876,8 +3885,8 @@ fn run(command: Command) -> i32 {
             return run_restore(cwd, include_master, no_resume)
         }
 
-        Command::Reinject { role, surface, check, timeout } => {
-            return run_reinject(role, surface, check, timeout)
+        Command::Reinject { role, surface, check, timeout, no_inject, print_only } => {
+            return run_reinject(role, surface, check, timeout, no_inject, print_only)
         }
 
         Command::Watch { surface, to, until, timeout, since } => {
@@ -17501,7 +17510,26 @@ fn run_reinject(
     surface: Option<String>,
     check: bool,
     timeout: u64,
+    no_inject: bool,
+    print_only: bool,
 ) -> i32 {
+    if print_only {
+        // ★2026-09-30(오너 예외 승인): surface·RPC 완전 우회 — compose_directive는 파일만 읽는
+        // 순수 조회라, 살아있지 않은/거부되는 좌석에도 안전하게 본문을 얻을 수 있다.
+        return match role
+            .ok_or_else(|| "print-only는 --role 필수".to_string())
+            .and_then(|r| compose_directive(&r))
+        {
+            Ok(directive) => {
+                print!("{directive}");
+                0
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                1
+            }
+        };
+    }
     let result = (|| -> Result<(), String> {
         let sid = resolve_role_or_surface(&role, &surface)?;
         let entry = surface_entry(sid)?;
@@ -17535,13 +17563,27 @@ fn run_reinject(
                 println!("디렉티브 생존 확인 (ACK 수신) — 재주입 불필요");
                 return Ok(());
             }
+            // ★2026-09-30(오너 예외 승인 · phoenix 재주입 중복 재발방지): --no-inject 는 핑
+            // 전용이다 — ACK 못 받아도 폴백 전문 주입을 하지 않는다. 호출부(2차 핸드셰이크 등)가
+            // 1차 주입을 중복하지 않게 별도 stdout **줄 단위** 고정 문면으로 결과를 알린다 — phoenix 의
+            // `_REINJECT_NOACK_NOINJECT_LINE_RE` 가 이 문면을 대조한다(변경 시 그쪽도 갱신할 것).
+            if no_inject {
+                println!(
+                    "각성 핑 무응답 — no-inject 모드(주입 생략) ({timeout}s) surface:{sid}"
+                );
+                return Ok(());
+            }
             eprintln!("[reinject] ACK 없음 ({timeout}s) — 드리프트 판정, 재주입 진행");
         }
         let directive = compose_directive(&role_name)?;
         inject_text(sid, &directive)?;
+        // ★2026-09-30(오너 예외 승인): 전달이력 키(레인·세션id·역할·surface·지침해시)에 쓸 해시를
+        // 실제 주입된 그 본문에서 뽑아 같은 줄에 싣는다 — phoenix가 사후에 directive를 재조립해
+        // 추정하지 않고 이 줄만 파싱하면 되게 한다(sha256_hex는 pack-update reinject와 동일 산식).
         println!(
-            "reinjected {} bytes → surface:{sid} ({role_name})",
-            directive.len()
+            "reinjected {} bytes → surface:{sid} ({role_name}) directive_sha256={}",
+            directive.len(),
+            sha256_hex(&directive)
         );
         Ok(())
     })();
