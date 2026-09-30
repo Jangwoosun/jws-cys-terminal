@@ -7205,6 +7205,13 @@ async function start() {
     if (lb?.ok === false) return true;
     return ws.socket != null && lb?.ok === true;
   });
+  // 본부 탭 소실 수정(2026-09-28): 로그온 직후엔 기본 데몬(본부) 좌석이 아직 없어 본부 ws 의 tree 가 비고,
+  // 위 필터가 socket 없는 빈 ws 를 드롭한다 → 몇 초 뒤 autoboot/phoenix 가 띄운 본부 좌석이 붙을 탭이 없어
+  // 사이드바에서 본부가 사라졌다. 본부 ws 가 하나도 남지 않았으면 빈 본부 ws 하나를 둔다 — 아래 병합 루프와
+  // refreshPaneTitles 자동 입양이 본부 좌석을 이 탭에 채운다(부서 ws 의 tree:null 보존과 같은 방식).
+  if (!workspaces.some((w) => w.socket == null)) {
+    workspaces.push({ id: wsCounter++, name: UNTITLED, tree: null });
+  }
   // 구버전 자동 번호 이름("ws N")은 미정 표시로 이행
   for (const ws of workspaces) {
     if (/^ws \d+$/.test(ws.name)) ws.name = UNTITLED;
